@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 Pks13 Inhibitor Prediction:
-    Input: Csv file with SMILES column
-    Output: Prediction file and Image folder
+    Input: Csv file with SMILES column (input.csv)
+    Output: Folder (result) containing prediction file and image folders
 """
 
 import os
@@ -26,13 +26,18 @@ OUT_DIR = "result"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-BATCH_SIZE = 16   
+BATCH_SIZE = 16   # safer for stability
 TOP_K = 10
 THRESHOLD = 0.5
 
 CLASS_MAP = {0: "Non-Inhibitor", 1: "Inhibitor"}
 
 os.makedirs(OUT_DIR, exist_ok=True)
+
+# ---------------- DETERMINISTIC ---------------- #
+torch.manual_seed(42)
+np.random.seed(42)
+torch.use_deterministic_algorithms(True)
 
 # ---------------- DRAW FUNCTION ---------------- #
 def draw_molecule(smiles, top_atoms, save_path, pred_label, prob):
@@ -78,16 +83,22 @@ class WrappedModel(torch.nn.Module):
 # ---------------- LOAD MODEL ---------------- #
 checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
 
+base_model = EdgeAwareGCNNet(
+    in_channels=checkpoint["in_channels"],
+    edge_dim=checkpoint["edge_dim"],
+    hidden_dim=checkpoint["hidden_dim"]
+).to(DEVICE)
+
 base_model.load_state_dict(checkpoint["model_state_dict"])
 base_model.eval()
 
-model = WrappedModel(base_model).to(DEVICE)  
+model = WrappedModel(base_model).to(DEVICE)  # for GNNExplainer
 model.eval()
 
 
 explainer = Explainer(
     model=model,
-    algorithm=GNNExplainer(epochs=100),  
+    algorithm=GNNExplainer(epochs=100),  # keep moderate for speed
     explanation_type='model',
     node_mask_type='attributes',
     edge_mask_type='object',
@@ -130,7 +141,7 @@ for g in graphs:
 print(f"Valid molecules: {len(graphs)}")
 
 
-# ---------------- MAIN ---------------- #
+# ---------------- MAIN INFERENCE ---------------- #
 def run_inference(model, dataset):
     loader = PyGDataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
 
@@ -151,7 +162,25 @@ def run_inference(model, dataset):
             probs = torch.sigmoid(out).view(-1).cpu().numpy()
             preds = (probs > THRESHOLD).astype(int)
 
-        
+        scores = compute_grad_cam_for_batch(base_model, batch, target_class=1)
+        data_list = batch.to_data_list()
+
+        for i in range(len(data_list)):
+            data = data_list[i]
+            smiles = data.smiles
+            
+            ##--------------------- Grad-CAM ----------------#
+            gcam = scores[i]
+
+            if gcam is None or len(gcam) == 0:
+                gcam_top_atoms, gcam_atom_scores, atom_labels = [], [], []
+            else:
+                k = min(TOP_K, len(gcam))
+                idxs = np.argsort(gcam)[-k:][::-1]
+
+                gcam_top_atoms = idxs.tolist()
+                gcam_atom_scores = [float(gcam[x]) for x in gcam_top_atoms]
+
 ##-------------- GNNExplainer----------------#
             explanation = explainer(
                 x=data.x,
@@ -190,10 +219,10 @@ def run_inference(model, dataset):
             prob = float(probs[i])
             pred_label = CLASS_MAP[pred]
 
-
+            img_path = os.path.join(img_dir, f"mol_{idx_global}.png")
             gnnexp_img_path = os.path.join(gnn_img_dir, f"mol_{idx_global}.png")
 
-
+            draw_molecule(smiles, gcam_top_atoms, img_path, pred_label, prob)
             draw_molecule(smiles, gnn_top_atoms, gnnexp_img_path, pred_label, prob)
             
             results.append({
@@ -201,6 +230,11 @@ def run_inference(model, dataset):
                 "Predicted": pred,
                 "Predicted_Label": pred_label,
                 "Probability": prob,
+                "GCAM_Top_Atoms": ";".join(map(str, gcam_top_atoms)),
+                "GCAM_Atom_Scores": ";".join([f"{x:.4f}" for x in gcam_atom_scores]),
+                "GCAM_Atom_Labels": ";".join(gcam_atom_labels),
+
+                "GCAM_Image_Path": img_path,
                 
                 # GNNExplainer
                 "GNN_Top_Atoms": ";".join(map(str, gnn_top_atoms)),
@@ -215,11 +249,11 @@ def run_inference(model, dataset):
     return pd.DataFrame(results)
 
 
-# ---------------- RUNNING  ---------------- #
+# ---------------- RUN ---------------- #
 print("Running inference...")
 results_df = run_inference(model, graphs)
 
-# ---------------- SAVE RESULTS ---------------- #
+# ---------------- SAVE ---------------- #
 output_csv = os.path.join(OUT_DIR, "predictions_with_gradcam.csv")
 results_df.to_csv(output_csv, index=False)
 
